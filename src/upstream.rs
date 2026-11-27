@@ -3,6 +3,8 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::time::Duration;
 
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
+
 pub struct Api {
     client: Client,
     embeddings: Endpoint,
@@ -37,7 +39,22 @@ impl Endpoint {
         if let Some(key) = &self.key {
             request = request.bearer_auth(key);
         }
-        Ok(request.send().await?.error_for_status()?.json().await?)
+        let mut response = request.send().await?.error_for_status()?;
+        let too_large = "upstream response exceeds 1 MiB";
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_UPSTREAM_RESPONSE_BYTES as u64)
+        {
+            return Err(too_large.into());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES - body.len() {
+                return Err(too_large.into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(serde_json::from_slice(&body)?)
     }
 }
 

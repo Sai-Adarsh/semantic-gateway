@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{Json, Router, body::Body, http::StatusCode, response::IntoResponse, routing::post};
 use serde_json::{Value, json};
 use std::{
     net::TcpListener as StdListener,
@@ -421,4 +421,60 @@ fn rejects_out_of_range_gateway_settings_before_listening() {
     let output = Command::new(BIN).arg("--unknown").output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage:"));
+}
+
+#[tokio::test]
+async fn rejects_oversized_upstream_json_and_recovers() {
+    let server = Router::new()
+        .route(
+            "/embed",
+            post(|| async {
+                Json(json!({"data": [{"embedding": [1.0, 0.0]}], "extra": "x".repeat(1024 * 1024)}))
+            }),
+        )
+        .route(
+            "/generate",
+            post(|Json(body): Json<Value>| async move {
+                let extra = if body["messages"][0]["content"] == "oversized completion" {
+                    "x".repeat(1024 * 1024)
+                } else {
+                    String::new()
+                };
+                Json(json!({"choices": [{"message": {"content": "valid answer"}}], "extra": extra}))
+                    .into_response()
+                    .map(|body| Body::from_stream(body.into_data_stream()))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let gateway = Gateway::start(
+        &[
+            ("GATEWAY_API_KEY", KEY),
+            ("EMBEDDING_URL", &format!("http://{addr}/embed")),
+            ("GENERATION_URL", &format!("http://{addr}/generate")),
+            ("EMBEDDING_MODEL", "fixture"),
+            ("GENERATION_MODEL", "fixture"),
+        ],
+        false,
+    )
+    .await;
+    let mut statuses = Vec::new();
+    for body in [
+        json!({"prompt": "oversized embedding"}),
+        json!({"prompt": "oversized completion", "cacheable": false}),
+    ] {
+        statuses.push(gateway.generate(body).await.status());
+    }
+    assert_eq!(statuses, [StatusCode::BAD_GATEWAY; 2]);
+    let reply = gateway
+        .generate(json!({"prompt": "ordinary completion", "exact_only": true}))
+        .await
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(reply["answer"], "valid answer");
+    server.abort();
 }

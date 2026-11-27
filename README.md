@@ -33,6 +33,8 @@ cargo run --locked
 
 Send the gateway key as a bearer token to `/generate` and `/metrics`. Upstream keys are optional and use `EMBEDDING_API_KEY` and `GENERATION_API_KEY`. Use `CACHE_TTL_SECONDS`, `CACHE_CAPACITY`, `CACHE_SIMILARITY` and `LISTEN` to override the defaults.
 
+Embedding and generation response bodies are limited to 1 MiB each. The gateway returns HTTP 502 when an upstream response exceeds that limit.
+
 Each process serves one tenant and one generation policy. Use separate instances for different authorization scopes. Send `"cacheable":false` when a request needs a fresh answer. This bypasses embedding and caching.
 
 The cache stores each generated answer under its original prompt. Exact matches skip the embedding call and return `similarity: null` with `cache_hit: true`. Send `"exact_only":true` to cache repeated prompt text while skipping embedding and cosine lookup on misses. Exact-only entries are eligible for their original prompt, and a semantic hit never creates an exact entry for the matching query.
