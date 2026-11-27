@@ -62,3 +62,7 @@ pub fn normalize(mut vector: Vec<f64>) -> Option<Vec<f64>> {
     }
     Some(vector)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/cache.rs"]
+mod tests;

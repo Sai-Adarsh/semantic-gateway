@@ -82,3 +82,7 @@ impl<T> Waiter<T> {
         self.result.wait_for(Option::is_some).await.ok()?.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/flight.rs"]
+mod tests;

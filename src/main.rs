@@ -20,6 +20,10 @@ use std::{
 };
 use upstream::Backend;
 
+#[cfg(test)]
+#[path = "../tests/unit/generate.rs"]
+mod tests;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type FlightResult = std::result::Result<Completion, ()>;
 
