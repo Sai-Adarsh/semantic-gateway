@@ -316,6 +316,9 @@ async fn exact_duplicates_share_upstream_work_and_both_admission_limits_apply() 
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    let bypass = gateway.generate(json!({"prompt":"bypass", "cacheable":false})).await;
+    assert_eq!(bypass.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(bypass.headers()["retry-after"], "1");
     let joiner = gateway.clone();
     let follower = tokio::spawn(async move { joiner.generate(json!({"prompt":"burst"})).await });
     timeout(Duration::from_secs(2), async {
@@ -372,6 +375,71 @@ async fn exact_duplicates_share_upstream_work_and_both_admission_limits_apply() 
         StatusCode::BAD_GATEWAY
     );
     assert!(gateway.metrics().await.contains("semantic_inflight_keys 0"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn uncached_requests_share_the_upstream_limit_without_blocking_exact_hits() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let server = Router::new().route("/generate", post({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |Json(body): Json<Value>| {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                if body["messages"][0]["content"] == "blocked" {
+                    entered.notify_one();
+                    release.notified().await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})));
+                }
+                (StatusCode::OK, Json(json!({"choices":[{"message":{"content":"answer"}}]})))
+            }
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/generate", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let gateway = Arc::new(Gateway::start(
+        &[
+            ("GATEWAY_API_KEY", KEY),
+            ("EMBEDDING_URL", &url),
+            ("GENERATION_URL", &url),
+            ("EMBEDDING_MODEL", "fixture"),
+            ("GENERATION_MODEL", "fixture"),
+            ("CACHE_MAX_INFLIGHT", "1"),
+        ],
+        false,
+    ).await);
+    let warm = json!({"prompt":"warm", "exact_only":true});
+    assert_eq!(gateway.generate(warm.clone()).await.status(), StatusCode::OK);
+    let origin = gateway.clone();
+    let active = tokio::spawn(async move {
+        origin.generate(json!({"prompt":"blocked", "cacheable":false})).await
+    });
+    timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
+
+    let hit = gateway.generate(warm).await.error_for_status().unwrap().json::<Value>().await.unwrap();
+    assert_eq!(hit["cache_hit"], true);
+    for request in [
+        json!({"prompt":"new", "exact_only":true}),
+        json!({"prompt":"other", "cacheable":false}),
+    ] {
+        let response = gateway.generate(request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    let metrics = gateway.metrics().await;
+    assert!(metrics.contains("semantic_generation_calls_total 2\n"));
+    assert!(metrics.contains("semantic_overload_rejected_total 2\n"));
+    assert!(metrics.contains("semantic_inflight_keys 0\n"));
+    release.notify_one();
+    assert_eq!(active.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        gateway.generate(json!({"prompt":"new", "exact_only":true})).await.status(),
+        StatusCode::OK
+    );
     server.abort();
 }
 
