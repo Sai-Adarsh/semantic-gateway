@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{Json, Router, body::Body, http::StatusCode, response::IntoResponse, routing::post};
 use serde_json::{Value, json};
 use std::{
     net::TcpListener as StdListener,
@@ -440,10 +440,9 @@ async fn rejects_oversized_upstream_json_and_recovers() {
                 } else {
                     String::new()
                 };
-                (
-                    [("transfer-encoding", "chunked")],
-                    Json(json!({"choices": [{"message": {"content": "valid answer"}}], "extra": extra})),
-                )
+                Json(json!({"choices": [{"message": {"content": "valid answer"}}], "extra": extra}))
+                    .into_response()
+                    .map(|body| Body::from_stream(body.into_data_stream()))
             }),
         );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
