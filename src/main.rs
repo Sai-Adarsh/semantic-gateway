@@ -1,0 +1,168 @@
+mod cache;
+mod upstream;
+
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use cache::Cache;
+use serde::{Deserialize, Serialize};
+use std::{
+    error::Error,
+    net::SocketAddr,
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering::Relaxed}},
+    time::Duration,
+};
+use upstream::Backend;
+
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+struct App {
+    backend: Backend,
+    cache: Mutex<Cache>,
+    expected_auth: Option<String>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    generation_calls: AtomicU64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    prompt: String,
+    #[serde(default = "cache_default")]
+    cacheable: bool,
+}
+
+fn cache_default() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct Completion {
+    answer: String,
+    cache_hit: bool,
+    similarity: Option<f64>,
+}
+
+type Shared = Arc<App>;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let demo = match std::env::args().nth(1).as_deref() {
+        Some("--demo") => true,
+        None => false,
+        _ => return Err("usage: semantic-gateway [--demo]".into()),
+    };
+    let listen: SocketAddr = setting("LISTEN", "127.0.0.1:8090").parse()?;
+    let capacity: usize = setting("CACHE_CAPACITY", "512").parse()?;
+    let ttl: u64 = setting("CACHE_TTL_SECONDS", "600").parse()?;
+    let threshold: f64 = setting("CACHE_SIMILARITY", "0.98").parse()?;
+    if !(1..=4096).contains(&capacity) || !(1..=86_400).contains(&ttl)
+        || !(0.9..1.0).contains(&threshold)
+    {
+        return Err("invalid cache capacity, TTL, or similarity threshold".into());
+    }
+
+    let (backend, expected_auth) = if demo {
+        (Backend::Demo, None)
+    } else {
+        let key = std::env::var("GATEWAY_API_KEY")?;
+        if key.len() < 16 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err("GATEWAY_API_KEY must be at least 16 non-space ASCII characters".into());
+        }
+        (Backend::from_env()?, Some(format!("Bearer {key}")))
+    };
+
+    let state = Arc::new(App {
+        backend,
+        expected_auth,
+        cache: Mutex::new(Cache::new(capacity, Duration::from_secs(ttl), threshold)),
+        hits: AtomicU64::new(0),
+        misses: AtomicU64::new(0),
+        generation_calls: AtomicU64::new(0),
+    });
+    let app = Router::new()
+        .route("/healthz", get(|| async { StatusCode::OK }))
+        .route("/metrics", get(metrics))
+        .route("/generate", post(generate))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    eprintln!("semantic gateway listening on {} (demo={demo})", listener.local_addr()?);
+    axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    }).await?;
+    Ok(())
+}
+
+fn setting(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn authorized(app: &App, headers: &HeaderMap) -> bool {
+    let Some(expected) = &app.expected_auth else {
+        return true;
+    };
+    let Some(candidate) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let candidate = candidate.as_bytes();
+    candidate.len() == expected.len() && candidate.iter().zip(expected.bytes())
+        .fold(0, |difference, (candidate, expected)| difference | (candidate ^ expected)) == 0
+}
+
+async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): Json<Request>) -> Response {
+    if !authorized(&app, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.prompt.trim().is_empty() || request.prompt.len() > 8192 {
+        return (StatusCode::BAD_REQUEST, "prompt must be 1 to 8192 UTF-8 bytes").into_response();
+    }
+    match answer(&app, request).await {
+        Ok(completion) => Json(completion).into_response(),
+        Err(error) => {
+            eprintln!("upstream call failed: {error}");
+            (StatusCode::BAD_GATEWAY, "upstream inference or embedding call failed").into_response()
+        }
+    }
+}
+
+async fn answer(app: &App, request: Request) -> Result<Completion> {
+    let embedding = if request.cacheable {
+        let embedding = app.backend.embed(&request.prompt).await?;
+        if let Some((answer, score)) = app.cache.lock().expect("cache lock").find(&embedding) {
+            app.hits.fetch_add(1, Relaxed);
+            return Ok(Completion { answer, cache_hit: true, similarity: Some(score) });
+        }
+        app.misses.fetch_add(1, Relaxed);
+        Some(embedding)
+    } else {
+        None
+    };
+
+    app.generation_calls.fetch_add(1, Relaxed);
+    let answer = app.backend.generate(&request.prompt).await?;
+    if let Some(embedding) = embedding {
+        app.cache.lock().expect("cache lock").insert(embedding, answer.clone());
+    }
+    Ok(Completion { answer, cache_hit: false, similarity: None })
+}
+
+async fn metrics(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if !authorized(&app, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        format!(
+            "# TYPE semantic_cache_hits_total counter\nsemantic_cache_hits_total {}\n\
+             # TYPE semantic_cache_misses_total counter\nsemantic_cache_misses_total {}\n\
+             # TYPE semantic_generation_calls_total counter\nsemantic_generation_calls_total {}\n",
+            app.hits.load(Relaxed), app.misses.load(Relaxed), app.generation_calls.load(Relaxed)
+        ),
+    ).into_response()
+}
