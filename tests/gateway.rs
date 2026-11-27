@@ -150,6 +150,75 @@ async fn demo_caches_equivalent_prompts_and_bypasses_explicitly_uncacheable_requ
 }
 
 #[tokio::test]
+async fn exact_only_skips_embeddings_and_never_reuses_a_semantic_match() {
+    let embeds = Arc::new(AtomicUsize::new(0));
+    let generations = Arc::new(AtomicUsize::new(0));
+    let embed_count = embeds.clone();
+    let generation_count = generations.clone();
+    let upstream = Router::new()
+        .route(
+            "/embed",
+            post(move || {
+                let count = embed_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({"data":[{"embedding":[1.0,0.0]}]}))
+                }
+            }),
+        )
+        .route(
+            "/generate",
+            post(move |Json(body): Json<Value>| {
+                let count = generation_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let prompt = body["messages"][0]["content"].as_str().unwrap();
+                    Json(
+                        json!({"choices":[{"message":{"content":format!("answer for {prompt}")}}]}),
+                    )
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let gateway = Gateway::start(
+        &[
+            ("GATEWAY_API_KEY", KEY),
+            ("EMBEDDING_URL", &format!("http://{addr}/embed")),
+            ("GENERATION_URL", &format!("http://{addr}/generate")),
+            ("EMBEDDING_MODEL", "fixture"),
+            ("GENERATION_MODEL", "fixture"),
+        ],
+        false,
+    )
+    .await;
+    let cases = [
+        ("private query", true, false, "private query", 0, 1),
+        ("private query", true, true, "private query", 0, 1),
+        ("semantic source", false, false, "semantic source", 1, 2),
+        ("same vector", false, true, "semantic source", 2, 2),
+        ("same vector", true, false, "same vector", 2, 3),
+        ("same vector", false, true, "same vector", 2, 3),
+    ];
+    for (prompt, exact_only, cache_hit, expected, embedding_calls, generation_calls) in cases {
+        let result: Value = gateway
+            .generate(json!({"prompt":prompt,"exact_only":exact_only}))
+            .await
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(result["answer"], format!("answer for {expected}"));
+        assert_eq!(result["cache_hit"], cache_hit);
+        assert_eq!(embeds.load(Ordering::Relaxed), embedding_calls);
+        assert_eq!(generations.load(Ordering::Relaxed), generation_calls);
+    }
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn exact_duplicates_share_upstream_work_and_both_admission_limits_apply() {
     let upstream_calls = Arc::new(AtomicUsize::new(0));
     let generation_entered = Arc::new(Notify::new());
@@ -238,6 +307,15 @@ async fn exact_duplicates_share_upstream_work_and_both_admission_limits_apply() 
     timeout(Duration::from_secs(5), generation_entered.notified())
         .await
         .unwrap();
+    // The semantic flight occupies the only slot; an exact-only
+    // caller must not inherit the semantic result.
+    assert_eq!(
+        gateway
+            .generate(json!({"prompt":"burst", "exact_only":true}))
+            .await
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     let joiner = gateway.clone();
     let follower = tokio::spawn(async move { joiner.generate(json!({"prompt":"burst"})).await });
     timeout(Duration::from_secs(2), async {

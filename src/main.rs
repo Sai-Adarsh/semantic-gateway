@@ -46,6 +46,8 @@ struct Request {
     prompt: String,
     #[serde(default = "cache_default")]
     cacheable: bool,
+    #[serde(default)]
+    exact_only: bool,
 }
 
 fn cache_default() -> bool {
@@ -152,7 +154,10 @@ async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): 
     if !request.cacheable {
         return respond(&load(&app, request).await, false);
     }
-    let (waiter, coalesced) = match app.flights.admit(&request.prompt) {
+    if let Some(completion) = exact_match(&app, &request.prompt) {
+        return respond(&Ok(completion), false);
+    }
+    let (waiter, coalesced) = match app.flights.admit(&request.prompt, request.exact_only) {
         Admission::Lead(leader, waiter) => {
             // The load belongs to the group, not to the first HTTP connection.
             tokio::spawn(async move {
@@ -187,25 +192,46 @@ async fn load(app: &App, request: Request) -> FlightResult {
     answer(app, request).await.map_err(|error| eprintln!("upstream call failed: {error}"))
 }
 
+fn exact_match(app: &App, prompt: &str) -> Option<Completion> {
+    let answer = app.cache.lock().expect("cache lock").find_exact(prompt)?;
+    app.hits.fetch_add(1, Relaxed);
+    Some(Completion { answer, cache_hit: true, similarity: None })
+}
+
 async fn answer(app: &App, request: Request) -> Result<Completion> {
-    let embedding = if request.cacheable {
+    // Another flight may have stored this prompt after the request was admitted.
+    if request.cacheable {
+        if let Some(completion) = exact_match(app, &request.prompt) {
+            return Ok(completion);
+        }
+    }
+    let embedding = if request.cacheable && !request.exact_only {
         app.embedding_calls.fetch_add(1, Relaxed);
         let embedding = app.backend.embed(&request.prompt).await?;
-        if let Some((answer, score)) = app.cache.lock().expect("cache lock").find(&embedding) {
+        let mut cache = app.cache.lock().expect("cache lock");
+        if let Some(answer) = cache.find_exact(&request.prompt) {
+            app.hits.fetch_add(1, Relaxed);
+            return Ok(Completion { answer, cache_hit: true, similarity: None });
+        }
+        if let Some((answer, score)) = cache.find_semantic(&embedding) {
             app.hits.fetch_add(1, Relaxed);
             return Ok(Completion { answer, cache_hit: true, similarity: Some(score) });
         }
-        app.misses.fetch_add(1, Relaxed);
         Some(embedding)
     } else {
         None
     };
 
+    if request.cacheable {
+        app.misses.fetch_add(1, Relaxed);
+    }
     app.generation_calls.fetch_add(1, Relaxed);
     let answer = app.backend.generate(&request.prompt).await?;
-    if let Some(embedding) = embedding {
-        app.cache.lock().expect("cache lock").insert(embedding, answer.clone());
-    }
+    let answer = if request.cacheable {
+        app.cache.lock().expect("cache lock").insert(request.prompt, embedding, answer)
+    } else {
+        answer
+    };
     Ok(Completion { answer, cache_hit: false, similarity: None })
 }
 

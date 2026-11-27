@@ -18,7 +18,7 @@ async fn follower_gets_bad_gateway_and_slot_is_released_when_leader_disappears()
         joined: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
     });
-    let Admission::Lead(leader, _) = state.flights.admit("prompt") else {
+    let Admission::Lead(leader, _) = state.flights.admit("prompt", false) else {
         panic!("expected a leader with an empty table");
     };
     let response = generate(
@@ -27,6 +27,7 @@ async fn follower_gets_bad_gateway_and_slot_is_released_when_leader_disappears()
         Json(Request {
             prompt: "prompt".into(),
             cacheable: true,
+            exact_only: false,
         }),
     );
     tokio::pin!(response);
