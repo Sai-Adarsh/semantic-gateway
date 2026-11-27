@@ -20,3 +20,5 @@ jobs:
         run: rustup toolchain install 1.87.0 --profile minimal
       - name: Test
         run: cargo +1.87.0 test --locked
+      - name: Build release
+        run: cargo +1.87.0 build --locked --release
