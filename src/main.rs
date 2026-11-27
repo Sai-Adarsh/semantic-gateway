@@ -1,4 +1,5 @@
 mod cache;
+mod flight;
 mod upstream;
 
 use axum::{
@@ -9,6 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use cache::Cache;
+use flight::{Admission, Flights};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -18,15 +20,24 @@ use std::{
 };
 use upstream::Backend;
 
+#[cfg(test)]
+#[path = "../tests/unit/generate.rs"]
+mod tests;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+type FlightResult = std::result::Result<Completion, ()>;
 
 struct App {
     backend: Backend,
     cache: Mutex<Cache>,
+    flights: Arc<Flights<FlightResult>>,
     expected_auth: Option<String>,
     hits: AtomicU64,
     misses: AtomicU64,
+    embedding_calls: AtomicU64,
     generation_calls: AtomicU64,
+    joined: AtomicU64,
+    rejected: AtomicU64,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +59,13 @@ struct Completion {
     similarity: Option<f64>,
 }
 
+#[derive(Serialize)]
+struct ClientCompletion<'a> {
+    #[serde(flatten)]
+    completion: &'a Completion,
+    coalesced: bool,
+}
+
 type Shared = Arc<App>;
 
 #[tokio::main]
@@ -61,10 +79,15 @@ async fn main() -> Result<()> {
     let capacity: usize = setting("CACHE_CAPACITY", "512").parse()?;
     let ttl: u64 = setting("CACHE_TTL_SECONDS", "600").parse()?;
     let threshold: f64 = setting("CACHE_SIMILARITY", "0.98").parse()?;
+    let concurrent: usize = setting("CACHE_MAX_INFLIGHT", "64").parse()?;
+    let waiters: usize = setting("CACHE_MAX_WAITERS_PER_KEY", "64").parse()?;
     if !(1..=4096).contains(&capacity) || !(1..=86_400).contains(&ttl)
         || !(0.9..1.0).contains(&threshold)
     {
         return Err("invalid cache capacity, TTL, or similarity threshold".into());
+    }
+    if !(1..=1024).contains(&concurrent) || !(1..=256).contains(&waiters) {
+        return Err("CACHE_MAX_INFLIGHT must be 1 to 1024 and CACHE_MAX_WAITERS_PER_KEY must be 1 to 256".into());
     }
 
     let (backend, expected_auth) = if demo {
@@ -81,9 +104,13 @@ async fn main() -> Result<()> {
         backend,
         expected_auth,
         cache: Mutex::new(Cache::new(capacity, Duration::from_secs(ttl), threshold)),
+        flights: Arc::new(Flights::new(concurrent, waiters)),
         hits: AtomicU64::new(0),
         misses: AtomicU64::new(0),
+        embedding_calls: AtomicU64::new(0),
         generation_calls: AtomicU64::new(0),
+        joined: AtomicU64::new(0),
+        rejected: AtomicU64::new(0),
     });
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
@@ -122,17 +149,47 @@ async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): 
     if request.prompt.trim().is_empty() || request.prompt.len() > 8192 {
         return (StatusCode::BAD_REQUEST, "prompt must be 1 to 8192 UTF-8 bytes").into_response();
     }
-    match answer(&app, request).await {
-        Ok(completion) => Json(completion).into_response(),
-        Err(error) => {
-            eprintln!("upstream call failed: {error}");
-            (StatusCode::BAD_GATEWAY, "upstream inference or embedding call failed").into_response()
-        }
+    if !request.cacheable {
+        return respond(&load(&app, request).await, false);
     }
+    let (waiter, coalesced) = match app.flights.admit(&request.prompt) {
+        Admission::Lead(leader, waiter) => {
+            // The load belongs to the group, not to the first HTTP connection.
+            tokio::spawn(async move {
+                leader.complete(load(&app, request).await);
+            });
+            (waiter, false)
+        }
+        Admission::Join(waiter) => {
+            app.joined.fetch_add(1, Relaxed);
+            (waiter, true)
+        }
+        Admission::Saturated => {
+            app.rejected.fetch_add(1, Relaxed);
+            return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "1")],
+                    "cacheable work is at capacity").into_response();
+        }
+    };
+    match waiter.receive().await {
+        Some(completion) => respond(&completion, coalesced),
+        None => respond(&Err(()), coalesced),
+    }
+}
+
+fn respond(result: &FlightResult, coalesced: bool) -> Response {
+    match result {
+        Ok(completion) => Json(ClientCompletion { completion, coalesced }).into_response(),
+        Err(()) => (StatusCode::BAD_GATEWAY, "upstream inference or embedding call failed").into_response(),
+    }
+}
+
+async fn load(app: &App, request: Request) -> FlightResult {
+    answer(app, request).await.map_err(|error| eprintln!("upstream call failed: {error}"))
 }
 
 async fn answer(app: &App, request: Request) -> Result<Completion> {
     let embedding = if request.cacheable {
+        app.embedding_calls.fetch_add(1, Relaxed);
         let embedding = app.backend.embed(&request.prompt).await?;
         if let Some((answer, score)) = app.cache.lock().expect("cache lock").find(&embedding) {
             app.hits.fetch_add(1, Relaxed);
@@ -161,8 +218,14 @@ async fn metrics(State(app): State<Shared>, headers: HeaderMap) -> Response {
         format!(
             "# TYPE semantic_cache_hits_total counter\nsemantic_cache_hits_total {}\n\
              # TYPE semantic_cache_misses_total counter\nsemantic_cache_misses_total {}\n\
-             # TYPE semantic_generation_calls_total counter\nsemantic_generation_calls_total {}\n",
-            app.hits.load(Relaxed), app.misses.load(Relaxed), app.generation_calls.load(Relaxed)
+             # TYPE semantic_embedding_calls_total counter\nsemantic_embedding_calls_total {}\n\
+             # TYPE semantic_generation_calls_total counter\nsemantic_generation_calls_total {}\n\
+             # TYPE semantic_coalesced_requests_total counter\nsemantic_coalesced_requests_total {}\n\
+             # TYPE semantic_overload_rejected_total counter\nsemantic_overload_rejected_total {}\n\
+             # TYPE semantic_inflight_keys gauge\nsemantic_inflight_keys {}\n",
+            app.hits.load(Relaxed), app.misses.load(Relaxed), app.embedding_calls.load(Relaxed),
+            app.generation_calls.load(Relaxed), app.joined.load(Relaxed), app.rejected.load(Relaxed),
+            app.flights.len()
         ),
     ).into_response()
 }

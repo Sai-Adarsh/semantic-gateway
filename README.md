@@ -35,4 +35,8 @@ Send the gateway key as a bearer token to `/generate` and `/metrics`. Upstream k
 
 Each process serves one tenant and one generation policy. Use separate instances for different authorization scopes. Send `"cacheable":false` when a request needs a fresh answer. This bypasses embedding and caching.
 
+Concurrent cacheable requests for the same exact prompt share one embedding lookup and, on a miss, one generation call. All admitted callers receive the same result. Shared work continues if the originating client disconnects. A response with `coalesced: true` joined an active request, and `cache_hit` reports whether that request found a cache entry. Distinct prompts can still hit the semantic cache after a matching entry becomes available.
+
+Set `CACHE_MAX_INFLIGHT` to cap active distinct cacheable prompts and `CACHE_MAX_WAITERS_PER_KEY` to cap followers per prompt. Both default to 64. New work beyond either limit receives HTTP 503 with `Retry-After: 1`. Check `semantic_inflight_keys`, `semantic_coalesced_requests_total`, and `semantic_overload_rejected_total` to distinguish active work, joined requests, and overload. Embedding, generation, hit, and miss counters count the actual work performed.
+
 Cosine similarity can match prompts that require different answers. Measure the false-hit rate on representative prompt pairs. When estimating savings, include the embedding cost and latency of every cacheable request.
