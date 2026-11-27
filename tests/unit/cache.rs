@@ -20,9 +20,18 @@ fn finds_best_match_and_evicts_the_least_recently_used_entry() {
     assert!(cache.find_semantic(&[1.0]).is_none());
     assert_eq!(cache.find_semantic(&[1.0, 0.0]).unwrap().0, "precise");
     assert!(cache.find_exact("close").is_none());
-    cache.insert("precise".into(), Some(vec![1.0, 0.0]), "replacement".into());
-    assert_eq!(cache.find_exact("precise").unwrap(), "replacement");
     let mut expires = Cache::new(1, Duration::ZERO, 0.98);
     expires.insert("expired".into(), Some(vec![1.0]), "expired".into());
     assert!(expires.find_exact("expired").is_none());
+}
+
+#[test]
+fn overlapping_modes_preserve_the_first_answer_and_a_semantic_embedding() {
+    for (first, second) in [(Some(vec![1.0]), None), (None, Some(vec![1.0]))] {
+        let mut cache = Cache::new(1, Duration::from_secs(30), 0.98);
+        cache.insert("prompt".into(), first, "first".into());
+        assert_eq!(cache.insert("prompt".into(), second, "second".into()), "first");
+        assert_eq!(cache.find_exact("prompt").as_deref(), Some("first"));
+        assert_eq!(cache.find_semantic(&[1.0]), Some(("first".into(), 1.0)));
+    }
 }

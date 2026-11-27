@@ -37,7 +37,7 @@ Each process serves one tenant and one generation policy. Use separate instances
 
 The cache stores each generated answer under its original prompt. Exact matches skip the embedding call and return `similarity: null` with `cache_hit: true`. Send `"exact_only":true` to cache repeated prompt text while skipping embedding and cosine lookup on misses. Exact-only entries are eligible for their original prompt, and a semantic hit never creates an exact entry for the matching query.
 
-Concurrent misses for the same prompt and cache mode share an in-flight request. Exact-only requests have their own group so they cannot inherit a semantic candidate. All admitted callers receive the same result, and work continues if the originating client disconnects. A response with `coalesced: true` joined an active request.
+Concurrent misses for the same prompt and cache mode share an in-flight request. Exact-only requests have their own group so they cannot inherit a semantic candidate. If both groups generate for the same prompt, the cache keeps the first stored answer and can add the semantic embedding to that entry. Work continues if the originating client disconnects. A response with `coalesced: true` joined an active request.
 
 Set `CACHE_MAX_INFLIGHT` to cap active groups and `CACHE_MAX_WAITERS_PER_KEY` to cap followers per group. Both default to 64. New work beyond either limit receives HTTP 503 with `Retry-After: 1`. Check `semantic_inflight_keys`, `semantic_coalesced_requests_total`, and `semantic_overload_rejected_total` to distinguish active work, joined requests, and overload. Embedding, generation, hit, and miss counters count the actual work performed.
 

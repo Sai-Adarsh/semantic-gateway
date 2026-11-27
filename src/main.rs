@@ -227,9 +227,11 @@ async fn answer(app: &App, request: Request) -> Result<Completion> {
     }
     app.generation_calls.fetch_add(1, Relaxed);
     let answer = app.backend.generate(&request.prompt).await?;
-    if request.cacheable {
-        app.cache.lock().expect("cache lock").insert(request.prompt, embedding, answer.clone());
-    }
+    let answer = if request.cacheable {
+        app.cache.lock().expect("cache lock").insert(request.prompt, embedding, answer)
+    } else {
+        answer
+    };
     Ok(Completion { answer, cache_hit: false, similarity: None })
 }
 

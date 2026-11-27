@@ -50,13 +50,23 @@ impl Cache {
         answer
     }
 
-    pub fn insert(&mut self, prompt: String, embedding: Option<Vec<f64>>, answer: String) {
-        let now = Instant::now();
-        self.entries.retain(|entry| entry.expires > now && entry.prompt != prompt);
+    pub fn insert(&mut self, prompt: String, embedding: Option<Vec<f64>>, answer: String) -> String {
+        self.expire();
+        // Overlapping modes may both generate. Keep the answer that clients can already see.
+        if let Some(index) = self.entries.iter().position(|entry| entry.prompt == prompt) {
+            let entry = &mut self.entries[index];
+            if entry.embedding.is_none() {
+                entry.embedding = embedding;
+            }
+            return self.touch(index);
+        }
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
-        self.entries.push_back(Entry { prompt, embedding, answer, expires: now + self.ttl });
+        self.entries.push_back(Entry {
+            prompt, embedding, answer: answer.clone(), expires: Instant::now() + self.ttl,
+        });
+        answer
     }
 }
 
