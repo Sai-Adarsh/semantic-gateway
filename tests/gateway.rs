@@ -434,12 +434,14 @@ async fn uncached_requests_share_the_upstream_limit_without_blocking_exact_hits(
     assert!(metrics.contains("semantic_generation_calls_total 2\n"));
     assert!(metrics.contains("semantic_overload_rejected_total 2\n"));
     assert!(metrics.contains("semantic_inflight_keys 0\n"));
+    assert!(metrics.contains("semantic_inflight_loads 1\n"));
     release.notify_one();
     assert_eq!(active.await.unwrap().status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         gateway.generate(json!({"prompt":"new", "exact_only":true})).await.status(),
         StatusCode::OK
     );
+    assert!(gateway.metrics().await.contains("semantic_inflight_loads 0\n"));
     server.abort();
 }
 
