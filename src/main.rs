@@ -152,6 +152,9 @@ async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): 
         return (StatusCode::BAD_REQUEST, "prompt must be 1 to 8192 UTF-8 bytes").into_response();
     }
     if !request.cacheable {
+        let Some(_slot) = app.flights.admit_uncached() else {
+            return reject_overload(&app);
+        };
         return respond(&load(&app, request).await, false);
     }
     if let Some(completion) = exact_match(&app, &request.prompt) {
@@ -169,16 +172,18 @@ async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): 
             app.joined.fetch_add(1, Relaxed);
             (waiter, true)
         }
-        Admission::Saturated => {
-            app.rejected.fetch_add(1, Relaxed);
-            return (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "1")],
-                    "cacheable work is at capacity").into_response();
-        }
+        Admission::Saturated => return reject_overload(&app),
     };
     match waiter.receive().await {
         Some(completion) => respond(&completion, coalesced),
         None => respond(&Err(()), coalesced),
     }
+}
+
+fn reject_overload(app: &App) -> Response {
+    app.rejected.fetch_add(1, Relaxed);
+    (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "1")],
+     "upstream work or its waiters are at capacity").into_response()
 }
 
 fn respond(result: &FlightResult, coalesced: bool) -> Response {
@@ -248,10 +253,11 @@ async fn metrics(State(app): State<Shared>, headers: HeaderMap) -> Response {
              # TYPE semantic_generation_calls_total counter\nsemantic_generation_calls_total {}\n\
              # TYPE semantic_coalesced_requests_total counter\nsemantic_coalesced_requests_total {}\n\
              # TYPE semantic_overload_rejected_total counter\nsemantic_overload_rejected_total {}\n\
-             # TYPE semantic_inflight_keys gauge\nsemantic_inflight_keys {}\n",
+             # TYPE semantic_inflight_keys gauge\nsemantic_inflight_keys {}\n\
+             # TYPE semantic_inflight_loads gauge\nsemantic_inflight_loads {}\n",
             app.hits.load(Relaxed), app.misses.load(Relaxed), app.embedding_calls.load(Relaxed),
             app.generation_calls.load(Relaxed), app.joined.load(Relaxed), app.rejected.load(Relaxed),
-            app.flights.len()
+            app.flights.len(), app.flights.active_loads()
         ),
     ).into_response()
 }

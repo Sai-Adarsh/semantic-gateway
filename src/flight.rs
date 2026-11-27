@@ -1,5 +1,5 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit, watch};
 
 type ResultChannel<T> = watch::Receiver<Option<Arc<T>>>;
 
@@ -12,6 +12,7 @@ type Pending<T> = HashMap<Arc<str>, Entry<T>>;
 
 pub struct Flights<T> {
     entries: Mutex<[Pending<T>; 2]>,
+    slots: Arc<Semaphore>,
     capacity: usize,
     waiters_per_key: usize,
 }
@@ -27,6 +28,7 @@ pub struct Leader<T> {
     key: Arc<str>,
     mode: usize,
     result: watch::Sender<Option<Arc<T>>>,
+    slot: Option<OwnedSemaphorePermit>,
 }
 
 pub struct Waiter<T> {
@@ -36,11 +38,24 @@ pub struct Waiter<T> {
 
 impl<T> Flights<T> {
     pub fn new(capacity: usize, waiters_per_key: usize) -> Self {
-        Self { entries: Mutex::new([HashMap::new(), HashMap::new()]), capacity, waiters_per_key }
+        Self {
+            entries: Mutex::new([HashMap::new(), HashMap::new()]),
+            slots: Arc::new(Semaphore::new(capacity)),
+            capacity,
+            waiters_per_key,
+        }
     }
 
     pub fn len(&self) -> usize {
         self.entries.lock().expect("in-flight lock").iter().map(HashMap::len).sum()
+    }
+
+    pub fn active_loads(&self) -> usize {
+        self.capacity - self.slots.available_permits()
+    }
+
+    pub fn admit_uncached(&self) -> Option<SemaphorePermit<'_>> {
+        self.slots.try_acquire().ok()
     }
 
     pub fn admit(self: &Arc<Self>, prompt: &str, exact_only: bool) -> Admission<T> {
@@ -52,9 +67,9 @@ impl<T> Flights<T> {
             };
             return Admission::Join(Waiter { result: entry.result.clone(), _permit: Some(permit) });
         }
-        if entries.iter().map(HashMap::len).sum::<usize>() >= self.capacity {
+        let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             return Admission::Saturated;
-        }
+        };
 
         let (send, receive) = watch::channel(None);
         let key: Arc<str> = Arc::from(prompt);
@@ -63,21 +78,29 @@ impl<T> Flights<T> {
             waiters: Arc::new(Semaphore::new(self.waiters_per_key)),
         });
         Admission::Lead(
-            Leader { flights: self.clone(), key, mode, result: send },
+            Leader { flights: self.clone(), key, mode, result: send, slot: Some(slot) },
             Waiter { result: receive, _permit: None },
         )
     }
 }
 
 impl<T> Leader<T> {
-    pub fn complete(self, value: T) {
+    pub fn complete(mut self, value: T) {
+        self.release_capacity();
         self.result.send_replace(Some(Arc::new(value)));
+    }
+
+    fn release_capacity(&mut self) {
+        let Some(slot) = self.slot.take() else { return; };
+        let mut entries = self.flights.entries.lock().expect("in-flight lock");
+        entries[self.mode].remove(&self.key);
+        drop(slot);
     }
 }
 
 impl<T> Drop for Leader<T> {
     fn drop(&mut self) {
-        self.flights.entries.lock().expect("in-flight lock")[self.mode].remove(&self.key);
+        self.release_capacity();
     }
 }
 
