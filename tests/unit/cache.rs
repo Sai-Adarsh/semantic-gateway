@@ -12,16 +12,17 @@ fn rejects_unusable_vectors_and_normalizes_large_values() {
 #[test]
 fn finds_best_match_and_evicts_the_least_recently_used_entry() {
     let mut cache = Cache::new(2, Duration::from_secs(30), 0.98);
-    cache.insert(vec![1.0, 0.0], "precise".into());
-    cache.insert(vec![0.99, 0.1], "close".into());
-    assert_eq!(cache.find(&[1.0, 0.0]).unwrap().0, "precise");
-    cache.insert(vec![0.0, 1.0], "other".into());
-    assert!(cache.find(&[0.98, 0.0]).is_none());
-    assert!(cache.find(&[1.0]).is_none());
-    assert_eq!(cache.find(&[1.0, 0.0]).unwrap().0, "precise");
-    cache.insert(vec![1.0, 0.0], "replacement".into());
-    assert_eq!(cache.find(&[1.0, 0.0]).unwrap().0, "replacement");
+    cache.insert("precise".into(), Some(vec![1.0, 0.0]), "precise".into());
+    cache.insert("close".into(), Some(vec![0.99, 0.1]), "close".into());
+    assert_eq!(cache.find_semantic(&[1.0, 0.0]).unwrap().0, "precise");
+    cache.insert("other".into(), Some(vec![0.0, 1.0]), "other".into());
+    assert!(cache.find_semantic(&[0.98, 0.0]).is_none());
+    assert!(cache.find_semantic(&[1.0]).is_none());
+    assert_eq!(cache.find_semantic(&[1.0, 0.0]).unwrap().0, "precise");
+    assert!(cache.find_exact("close").is_none());
+    cache.insert("precise".into(), Some(vec![1.0, 0.0]), "replacement".into());
+    assert_eq!(cache.find_exact("precise").unwrap(), "replacement");
     let mut expires = Cache::new(1, Duration::ZERO, 0.98);
-    expires.insert(vec![1.0], "expired".into());
-    assert!(expires.find(&[1.0]).is_none());
+    expires.insert("expired".into(), Some(vec![1.0]), "expired".into());
+    assert!(expires.find_exact("expired").is_none());
 }

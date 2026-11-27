@@ -1,7 +1,8 @@
 use std::{collections::VecDeque, time::{Duration, Instant}};
 
 struct Entry {
-    embedding: Vec<f64>,
+    prompt: String,
+    embedding: Option<Vec<f64>>,
     answer: String,
     expires: Instant,
 }
@@ -18,30 +19,44 @@ impl Cache {
         Self { entries: VecDeque::new(), capacity, ttl, threshold }
     }
 
-    pub fn find(&mut self, embedding: &[f64]) -> Option<(String, f64)> {
-        let now = Instant::now();
-        self.entries.retain(|entry| entry.expires > now);
+    pub fn find_exact(&mut self, prompt: &str) -> Option<String> {
+        self.expire();
+        let index = self.entries.iter().position(|entry| entry.prompt == prompt)?;
+        Some(self.touch(index))
+    }
+
+    pub fn find_semantic(&mut self, embedding: &[f64]) -> Option<(String, f64)> {
+        self.expire();
         let (index, score) = self.entries.iter().enumerate()
-            .filter(|(_, entry)| entry.embedding.len() == embedding.len())
-            .map(|(index, entry)| {
-                let score: f64 = entry.embedding.iter().zip(embedding).map(|(a, b)| a * b).sum();
-                (index, score.clamp(-1.0, 1.0))
+            .filter_map(|(index, entry)| {
+                let candidate = entry.embedding.as_ref().filter(|value| value.len() == embedding.len())?;
+                let score: f64 = candidate.iter().zip(embedding).map(|(a, b)| a * b).sum();
+                Some((index, score.clamp(-1.0, 1.0)))
             })
             .filter(|&(_, score)| score > self.threshold)
             .max_by(|left, right| left.1.total_cmp(&right.1))?;
+        Some((self.touch(index), score))
+    }
+
+    fn expire(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|entry| entry.expires > now);
+    }
+
+    fn touch(&mut self, index: usize) -> String {
         let entry = self.entries.remove(index).expect("matching cache entry");
         let answer = entry.answer.clone();
         self.entries.push_back(entry);
-        Some((answer, score))
+        answer
     }
 
-    pub fn insert(&mut self, embedding: Vec<f64>, answer: String) {
+    pub fn insert(&mut self, prompt: String, embedding: Option<Vec<f64>>, answer: String) {
         let now = Instant::now();
-        self.entries.retain(|entry| entry.expires > now && entry.embedding != embedding);
+        self.entries.retain(|entry| entry.expires > now && entry.prompt != prompt);
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
-        self.entries.push_back(Entry { embedding, answer, expires: now + self.ttl });
+        self.entries.push_back(Entry { prompt, embedding, answer, expires: now + self.ttl });
     }
 }
 

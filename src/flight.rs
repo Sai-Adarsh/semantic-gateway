@@ -8,8 +8,10 @@ struct Entry<T> {
     waiters: Arc<Semaphore>,
 }
 
+type Pending<T> = HashMap<Arc<str>, Entry<T>>;
+
 pub struct Flights<T> {
-    entries: Mutex<HashMap<Arc<str>, Entry<T>>>,
+    entries: Mutex<[Pending<T>; 2]>,
     capacity: usize,
     waiters_per_key: usize,
 }
@@ -23,6 +25,7 @@ pub enum Admission<T> {
 pub struct Leader<T> {
     flights: Arc<Flights<T>>,
     key: Arc<str>,
+    mode: usize,
     result: watch::Sender<Option<Arc<T>>>,
 }
 
@@ -33,33 +36,34 @@ pub struct Waiter<T> {
 
 impl<T> Flights<T> {
     pub fn new(capacity: usize, waiters_per_key: usize) -> Self {
-        Self { entries: Mutex::new(HashMap::new()), capacity, waiters_per_key }
+        Self { entries: Mutex::new([HashMap::new(), HashMap::new()]), capacity, waiters_per_key }
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("in-flight lock").len()
+        self.entries.lock().expect("in-flight lock").iter().map(HashMap::len).sum()
     }
 
-    pub fn admit(self: &Arc<Self>, prompt: &str) -> Admission<T> {
+    pub fn admit(self: &Arc<Self>, prompt: &str, exact_only: bool) -> Admission<T> {
+        let mode = usize::from(exact_only);
         let mut entries = self.entries.lock().expect("in-flight lock");
-        if let Some(entry) = entries.get(prompt) {
+        if let Some(entry) = entries[mode].get(prompt) {
             let Ok(permit) = entry.waiters.clone().try_acquire_owned() else {
                 return Admission::Saturated;
             };
             return Admission::Join(Waiter { result: entry.result.clone(), _permit: Some(permit) });
         }
-        if entries.len() >= self.capacity {
+        if entries.iter().map(HashMap::len).sum::<usize>() >= self.capacity {
             return Admission::Saturated;
         }
 
         let (send, receive) = watch::channel(None);
         let key: Arc<str> = Arc::from(prompt);
-        entries.insert(key.clone(), Entry {
+        entries[mode].insert(key.clone(), Entry {
             result: receive.clone(),
             waiters: Arc::new(Semaphore::new(self.waiters_per_key)),
         });
         Admission::Lead(
-            Leader { flights: self.clone(), key, result: send },
+            Leader { flights: self.clone(), key, mode, result: send },
             Waiter { result: receive, _permit: None },
         )
     }
@@ -73,7 +77,7 @@ impl<T> Leader<T> {
 
 impl<T> Drop for Leader<T> {
     fn drop(&mut self) {
-        self.flights.entries.lock().expect("in-flight lock").remove(&self.key);
+        self.flights.entries.lock().expect("in-flight lock")[self.mode].remove(&self.key);
     }
 }
 
