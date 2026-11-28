@@ -548,3 +548,24 @@ async fn rejects_oversized_upstream_json_and_recovers() {
     assert_eq!(reply["answer"], "valid answer");
     server.abort();
 }
+
+#[tokio::test]
+async fn accepts_escaped_json_for_an_in_limit_utf8_prompt() {
+    let gateway = Gateway::start(&[], true).await;
+    let prompt = "é".repeat(4096);
+    let body = format!(
+        r#"{{"prompt":"{}","cacheable":false}}"#,
+        r"\u00e9".repeat(4096),
+    );
+    let response = gateway
+        .client
+        .post(format!("{}/generate", gateway.base))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let completion: Value = response.json().await.unwrap();
+    assert_eq!(completion["answer"], format!("Fixture response for: {prompt}"));
+}

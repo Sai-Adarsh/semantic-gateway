@@ -27,6 +27,10 @@ mod tests;
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 type FlightResult = std::result::Result<Completion, ()>;
 
+const MAX_PROMPT_BYTES: usize = 8 * 1024;
+// A JSON Unicode escape can take six bytes for one decoded ASCII byte.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
 struct App {
     backend: Backend,
     cache: Mutex<Cache>,
@@ -118,7 +122,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/metrics", get(metrics))
         .route("/generate", post(generate))
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("semantic gateway listening on {} (demo={demo})", listener.local_addr()?);
@@ -148,7 +152,7 @@ async fn generate(State(app): State<Shared>, headers: HeaderMap, Json(request): 
     if !authorized(&app, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if request.prompt.trim().is_empty() || request.prompt.len() > 8192 {
+    if request.prompt.trim().is_empty() || request.prompt.len() > MAX_PROMPT_BYTES {
         return (StatusCode::BAD_REQUEST, "prompt must be 1 to 8192 UTF-8 bytes").into_response();
     }
     if !request.cacheable {
