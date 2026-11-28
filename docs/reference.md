@@ -35,6 +35,8 @@ cargo run --locked
 
 Send the gateway key as a bearer token to `/generate` and `/metrics`. Upstream keys are optional and use `EMBEDDING_API_KEY` and `GENERATION_API_KEY`. Use `CACHE_TTL_SECONDS`, `CACHE_CAPACITY`, `CACHE_SIMILARITY` and `LISTEN` to override the defaults.
 
+Prompts are limited to 8192 UTF-8 bytes after JSON decoding. The HTTP request body is limited to 64 KiB.
+
 Embedding and generation response bodies are limited to 1 MiB each. The gateway returns HTTP 502 when an upstream response exceeds that limit.
 
 Each process serves one tenant and one generation policy. Use separate instances for different authorization scopes.
